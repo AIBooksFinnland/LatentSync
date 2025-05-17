@@ -54,6 +54,21 @@ class UNetDataset(Dataset):
         self.audio_mel_cache_dir = config.data.audio_mel_cache_dir
         os.makedirs(self.audio_mel_cache_dir, exist_ok=True)
 
+        # When DataLoader is created with ``num_workers=0`` the ``worker_init_fn``
+        # hook will never be called, which means ``self.worker_id`` and the
+        # corresponding ``image_processor`` attribute would be missing.  This
+        # leads to an ``AttributeError`` the first time ``__getitem__`` is
+        # invoked.  To make the dataset robust in both single and multi worker
+        # scenarios we initialize ``worker_id`` to ``0`` and create the default
+        # image processor here.  The ``worker_init_fn`` will overwrite these
+        # values when multiple workers are used.
+        self.worker_id = 0
+        setattr(
+            self,
+            "image_processor_0",
+            ImageProcessor(self.resolution, self.mask, mask_image=self.mask_image),
+        )
+
     def __len__(self):
         return len(self.video_paths)
 
