@@ -49,6 +49,10 @@ class SyncNetDataset(Dataset):
         self.audio_mel_cache_dir = config.data.audio_mel_cache_dir
         os.makedirs(self.audio_mel_cache_dir, exist_ok=True)
 
+        # ``worker_init_fn`` is not executed when ``num_workers=0``.  Initialize
+        # ``worker_id`` here so that single-worker dataloaders work as well.
+        self.worker_id = 0
+
     def __len__(self):
         return len(self.video_paths)
 
