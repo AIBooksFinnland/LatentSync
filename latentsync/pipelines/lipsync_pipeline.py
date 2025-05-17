@@ -36,6 +36,13 @@ from ..whisper.audio2feature import Audio2Feature
 import tqdm
 import soundfile as sf
 
+
+def _segment_is_silent(segment: torch.Tensor, threshold: float = 0.01) -> bool:
+    """Return ``True`` if ``segment`` is close to silence."""
+    if segment.numel() == 0:
+        return True
+    return segment.abs().mean().item() < threshold
+
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
@@ -327,6 +334,8 @@ class LipsyncPipeline(DiffusionPipeline):
 
         faces, original_video_frames, boxes, affine_matrices = self.affine_transform_video(video_path)
         audio_samples = read_audio(audio_path)
+        samples_per_frame = int(audio_sample_rate / video_fps)
+        chunk_samples = samples_per_frame * num_frames
 
         # 1. Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
@@ -375,6 +384,9 @@ class LipsyncPipeline(DiffusionPipeline):
         )
 
         for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
+            start_sample = i * chunk_samples
+            end_sample = start_sample + chunk_samples
+            silent = _segment_is_silent(audio_samples[start_sample:end_sample])
             if self.unet.add_audio_layer:
                 audio_embeds = torch.stack(whisper_chunks[i * num_frames : (i + 1) * num_frames])
                 audio_embeds = audio_embeds.to(device, dtype=weight_dtype)
@@ -410,41 +422,45 @@ class LipsyncPipeline(DiffusionPipeline):
                 do_classifier_free_guidance,
             )
 
-            # 9. Denoising loop
-            num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-            with self.progress_bar(total=num_inference_steps) as progress_bar:
-                for j, t in enumerate(timesteps):
-                    # expand the latents if we are doing classifier free guidance
-                    latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+            if not silent:
+                # 9. Denoising loop
+                num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+                with self.progress_bar(total=num_inference_steps) as progress_bar:
+                    for j, t in enumerate(timesteps):
+                        # expand the latents if we are doing classifier free guidance
+                        latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
 
-                    # concat latents, mask, masked_image_latents in the channel dimension
-                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-                    latent_model_input = torch.cat(
-                        [latent_model_input, mask_latents, masked_image_latents, image_latents], dim=1
-                    )
+                        # concat latents, mask, masked_image_latents in the channel dimension
+                        latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                        latent_model_input = torch.cat(
+                            [latent_model_input, mask_latents, masked_image_latents, image_latents], dim=1
+                        )
 
-                    # predict the noise residual
-                    noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=audio_embeds).sample
+                        # predict the noise residual
+                        noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=audio_embeds).sample
 
-                    # perform guidance
-                    if do_classifier_free_guidance:
-                        noise_pred_uncond, noise_pred_audio = noise_pred.chunk(2)
-                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_audio - noise_pred_uncond)
+                        # perform guidance
+                        if do_classifier_free_guidance:
+                            noise_pred_uncond, noise_pred_audio = noise_pred.chunk(2)
+                            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_audio - noise_pred_uncond)
 
-                    # compute the previous noisy sample x_t -> x_t-1
-                    latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+                        # compute the previous noisy sample x_t -> x_t-1
+                        latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
 
-                    # call the callback, if provided
-                    if j == len(timesteps) - 1 or ((j + 1) > num_warmup_steps and (j + 1) % self.scheduler.order == 0):
-                        progress_bar.update()
-                        if callback is not None and j % callback_steps == 0:
-                            callback(j, t, latents)
+                        # call the callback, if provided
+                        if j == len(timesteps) - 1 or ((j + 1) > num_warmup_steps and (j + 1) % self.scheduler.order == 0):
+                            progress_bar.update()
+                            if callback is not None and j % callback_steps == 0:
+                                callback(j, t, latents)
 
-            # Recover the pixel values
-            decoded_latents = self.decode_latents(latents)
-            decoded_latents = self.paste_surrounding_pixels_back(
-                decoded_latents, pixel_values, 1 - masks, device, weight_dtype
-            )
+                # Recover the pixel values
+                decoded_latents = self.decode_latents(latents)
+                decoded_latents = self.paste_surrounding_pixels_back(
+                    decoded_latents, pixel_values, 1 - masks, device, weight_dtype
+                )
+            else:
+                # Keep the original faces if the audio chunk is silent
+                decoded_latents = pixel_values
             synced_video_frames.append(decoded_latents)
             # masked_video_frames.append(masked_pixel_values)
 
